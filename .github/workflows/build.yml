@@ -121,78 +121,6 @@ jobs:
           echo "В исходниках нет приложения: не нашёл ни AndroidManifest.xml, ни apktool.yml" | tee -a out/build.log
           exit 1
 
-      - name: Gradle build
-        if: env.PROJECT != ''
-        run: |
-          cd "$PROJECT"
-          [ -f local.properties ] || echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
-          [ -f gradlew ] && chmod +x gradlew
-          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
-          LOG="$GITHUB_WORKSPACE/out/build.log"
-          run_gradle() {
-            export JAVA_HOME="$1"
-            export PATH="$JAVA_HOME/bin:$PATH"
-            echo "=== JAVA_HOME=$JAVA_HOME ===" >> "$LOG"
-            if [ -f gradlew ]; then
-              ./gradlew --no-daemon --stacktrace "$TASK" >> "$LOG" 2>&1
-            else
-              gradle --no-daemon --stacktrace "$TASK" >> "$LOG" 2>&1
-            fi
-          }
-          set +e
-          run_gradle "${JAVA_HOME_17_X64:-$JAVA_HOME}"
-          code=$?
-          if [ $code -ne 0 ] && grep -qE "class file major version|Unsupported Java|Unsupported class|requires Java|invalid source release|toolchain" "$LOG"; then
-            echo "=== несовместимая версия Java, пробую другие JDK ===" >> "$LOG"
-            for alt in "$JAVA_HOME_21_X64" "$JAVA_HOME_11_X64" "$JAVA_HOME_8_X64"; do
-              [ -n "$alt" ] || continue
-              [ -d "$alt" ] || continue
-              run_gradle "$alt"
-              code=$?
-              [ $code -eq 0 ] && break
-            done
-          fi
-          tail -n 40 "$LOG"
-          exit $code
-
-      - name: Build with apktool
-        if: env.KIND == 'apktool'
-        run: |
-          set +e
-          LOG="$GITHUB_WORKSPACE/out/build.log"
-          built="$GITHUB_WORKSPACE/built"
-          mkdir -p "$built" out
-          echo "=== сборка распакованного приложения ===" >> "$LOG"
-          url=""
-          for i in 1 2 3; do
-            url=$(curl -fsSL "https://api.github.com/repos/iBotPeaches/Apktool/releases/latest" \
-              | grep -o '"browser_download_url": *"[^"]*apktool_[0-9.]*\.jar"' | head -n 1 | cut -d'"' -f4)
-            [ -n "$url" ] && break
-            sleep 3
-          done
-          if [ -z "$url" ]; then
-            url="https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar"
-          fi
-          echo "Сборщик: $url" >> "$LOG"
-          curl -fsSL "$url" -o /tmp/apktool.jar
-          if [ ! -s /tmp/apktool.jar ]; then
-            echo "Не смог скачать сборщик apktool" >> "$LOG"
-            tail -n 20 "$LOG"
-            exit 1
-          fi
-          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
-          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-34" "build-tools;34.0.0" >/dev/null 2>&1 || true
-          cd "$APKDIR"
-          java -jar /tmp/apktool.jar b -f --use-aapt2 . -o "$built/app.apktool.apk" >> "$LOG" 2>&1
-          code=$?
-          if [ $code -ne 0 ]; then
-            echo "=== пробую без aapt2 ===" >> "$LOG"
-            java -jar /tmp/apktool.jar b -f . -o "$built/app.apktool.apk" >> "$LOG" 2>&1
-            code=$?
-          fi
-          tail -n 40 "$LOG"
-          exit $code
-
       - name: Make project
         if: env.KIND == 'sources'
         run: |
@@ -389,6 +317,78 @@ jobs:
           echo "PROJECT=$GITHUB_WORKSPACE/auto" >> "$GITHUB_ENV"
           echo "Проект вокруг исходников готов, запускаю сборку" >> "$LOG"
           tail -n 20 "$LOG"
+
+      - name: Gradle build
+        if: env.PROJECT != ''
+        run: |
+          cd "$PROJECT"
+          [ -f local.properties ] || echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          [ -f gradlew ] && chmod +x gradlew
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          LOG="$GITHUB_WORKSPACE/out/build.log"
+          run_gradle() {
+            export JAVA_HOME="$1"
+            export PATH="$JAVA_HOME/bin:$PATH"
+            echo "=== JAVA_HOME=$JAVA_HOME ===" >> "$LOG"
+            if [ -f gradlew ]; then
+              ./gradlew --no-daemon --stacktrace "$TASK" >> "$LOG" 2>&1
+            else
+              gradle --no-daemon --stacktrace "$TASK" >> "$LOG" 2>&1
+            fi
+          }
+          set +e
+          run_gradle "${JAVA_HOME_17_X64:-$JAVA_HOME}"
+          code=$?
+          if [ $code -ne 0 ] && grep -qE "class file major version|Unsupported Java|Unsupported class|requires Java|invalid source release|toolchain" "$LOG"; then
+            echo "=== несовместимая версия Java, пробую другие JDK ===" >> "$LOG"
+            for alt in "$JAVA_HOME_21_X64" "$JAVA_HOME_11_X64" "$JAVA_HOME_8_X64"; do
+              [ -n "$alt" ] || continue
+              [ -d "$alt" ] || continue
+              run_gradle "$alt"
+              code=$?
+              [ $code -eq 0 ] && break
+            done
+          fi
+          tail -n 40 "$LOG"
+          exit $code
+
+      - name: Build with apktool
+        if: env.KIND == 'apktool'
+        run: |
+          set +e
+          LOG="$GITHUB_WORKSPACE/out/build.log"
+          built="$GITHUB_WORKSPACE/built"
+          mkdir -p "$built" out
+          echo "=== сборка распакованного приложения ===" >> "$LOG"
+          url=""
+          for i in 1 2 3; do
+            url=$(curl -fsSL "https://api.github.com/repos/iBotPeaches/Apktool/releases/latest" \
+              | grep -o '"browser_download_url": *"[^"]*apktool_[0-9.]*\.jar"' | head -n 1 | cut -d'"' -f4)
+            [ -n "$url" ] && break
+            sleep 3
+          done
+          if [ -z "$url" ]; then
+            url="https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar"
+          fi
+          echo "Сборщик: $url" >> "$LOG"
+          curl -fsSL "$url" -o /tmp/apktool.jar
+          if [ ! -s /tmp/apktool.jar ]; then
+            echo "Не смог скачать сборщик apktool" >> "$LOG"
+            tail -n 20 "$LOG"
+            exit 1
+          fi
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-34" "build-tools;34.0.0" >/dev/null 2>&1 || true
+          cd "$APKDIR"
+          java -jar /tmp/apktool.jar b -f --use-aapt2 . -o "$built/app.apktool.apk" >> "$LOG" 2>&1
+          code=$?
+          if [ $code -ne 0 ]; then
+            echo "=== пробую без aapt2 ===" >> "$LOG"
+            java -jar /tmp/apktool.jar b -f . -o "$built/app.apktool.apk" >> "$LOG" 2>&1
+            code=$?
+          fi
+          tail -n 40 "$LOG"
+          exit $code
 
       - name: Collect and sign
         if: always()
