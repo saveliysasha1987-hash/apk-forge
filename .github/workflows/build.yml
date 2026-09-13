@@ -1,0 +1,451 @@
+name: apkforge
+run-name: ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Метка сборки (её ищет бот)"
+        required: true
+      mode:
+        description: "zip или repo"
+        required: true
+        default: "zip"
+      source:
+        description: "Ссылка на zip или адрес репозитория; пусто — взять из секрета FORGE_SRC_URL"
+        required: false
+        default: ""
+      ref:
+        description: "Ветка или тег (только для repo)"
+        required: false
+        default: ""
+      task:
+        description: "Задача Gradle"
+        required: false
+        default: "assembleDebug"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MODE: ${{ inputs.mode }}
+      SRC: ${{ inputs.source }}
+      SRC_SECRET: ${{ secrets.FORGE_SRC_URL }}
+      REF: ${{ inputs.ref }}
+      TASK: ${{ inputs.task }}
+      KS_B64: ${{ secrets.FORGE_KEYSTORE }}
+      KS_PASS: ${{ secrets.FORGE_KEYPASS }}
+      KS_ALIAS: ${{ secrets.FORGE_KEY_ALIAS }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Prepare keystore
+        run: |
+          set +e
+          mkdir -p out
+          if [ -z "$KS_B64" ]; then
+            echo "Ключ подписи не настроен: нет секрета FORGE_KEYSTORE" >> out/build.log
+            exit 0
+          fi
+          printf '%s' "$KS_B64" | tr -d '\n\r ' | base64 -d > /tmp/forge.jks 2>/dev/null
+          if [ -s /tmp/forge.jks ]; then
+            echo "Ключ подписи загружен из секретов" >> out/build.log
+          else
+            rm -f /tmp/forge.jks
+            echo "Ключ подписи не декодировался: проверь секрет FORGE_KEYSTORE" >> out/build.log
+          fi
+          exit 0
+      - name: Get sources
+        run: |
+          set -e
+          mkdir -p src out
+          if [ "$MODE" = "repo" ]; then
+            if [ -n "$REF" ]; then
+              git clone --depth 1 --branch "$REF" "$SRC" src
+            else
+              git clone --depth 1 "$SRC" src
+            fi
+          else
+            src="$SRC"
+            [ -n "$src" ] || src="$SRC_SECRET"
+            case "$src" in
+              http*)
+                curl -fsSL "$src" -o src.zip
+                ;;
+              *)
+                echo "Не понял источник: нужна ссылка на zip или секрет FORGE_SRC_URL"
+                exit 1
+                ;;
+            esac
+            unzip -q -o src.zip -d src
+          fi
+          find src -maxdepth 2 | head -n 40
+      - name: Prepare project
+        run: |
+          set -e
+          echo "KIND=none" >> "$GITHUB_ENV"
+          root=""
+          for f in $(find src -maxdepth 6 \( -name settings.gradle -o -name settings.gradle.kts \) | sort); do
+            root=$(dirname "$f")
+            break
+          done
+          if [ -z "$root" ]; then
+            for f in $(find src -maxdepth 6 \( -name build.gradle -o -name build.gradle.kts \) | sort); do
+              root=$(dirname "$f")
+              break
+            done
+          fi
+          if [ -n "$root" ]; then
+            echo "PROJECT=$root" >> "$GITHUB_ENV"
+            echo "KIND=gradle" >> "$GITHUB_ENV"
+            echo "Нашёл готовый проект сборки: $root"
+            exit 0
+          fi
+          f=$(find src -maxdepth 6 -name apktool.yml | sort | head -n 1)
+          if [ -n "$f" ]; then
+            echo "APKDIR=$(dirname "$f")" >> "$GITHUB_ENV"
+            echo "KIND=apktool" >> "$GITHUB_ENV"
+            echo "Нашёл распакованное приложение: $(dirname "$f")"
+            exit 0
+          fi
+          f=$(find src -maxdepth 6 -name AndroidManifest.xml | sort | head -n 1)
+          if [ -n "$f" ]; then
+            echo "MANIFEST=$f" >> "$GITHUB_ENV"
+            echo "KIND=sources" >> "$GITHUB_ENV"
+            echo "Нашёл исходники приложения без проекта сборки: $f"
+            exit 0
+          fi
+          echo "В исходниках нет приложения: не нашёл ни AndroidManifest.xml, ни apktool.yml" | tee -a out/build.log
+          exit 1
+
+      - name: Gradle build
+        if: env.PROJECT != ''
+        run: |
+          cd "$PROJECT"
+          [ -f local.properties ] || echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          [ -f gradlew ] && chmod +x gradlew
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          LOG="$GITHUB_WORKSPACE/out/build.log"
+          run_gradle() {
+            export JAVA_HOME="$1"
+            export PATH="$JAVA_HOME/bin:$PATH"
+            echo "=== JAVA_HOME=$JAVA_HOME ===" >> "$LOG"
+            if [ -f gradlew ]; then
+              ./gradlew --no-daemon --stacktrace "$TASK" >> "$LOG" 2>&1
+            else
+              gradle --no-daemon --stacktrace "$TASK" >> "$LOG" 2>&1
+            fi
+          }
+          set +e
+          run_gradle "${JAVA_HOME_17_X64:-$JAVA_HOME}"
+          code=$?
+          if [ $code -ne 0 ] && grep -qE "class file major version|Unsupported Java|Unsupported class|requires Java|invalid source release|toolchain" "$LOG"; then
+            echo "=== несовместимая версия Java, пробую другие JDK ===" >> "$LOG"
+            for alt in "$JAVA_HOME_21_X64" "$JAVA_HOME_11_X64" "$JAVA_HOME_8_X64"; do
+              [ -n "$alt" ] || continue
+              [ -d "$alt" ] || continue
+              run_gradle "$alt"
+              code=$?
+              [ $code -eq 0 ] && break
+            done
+          fi
+          tail -n 40 "$LOG"
+          exit $code
+
+      - name: Build with apktool
+        if: env.KIND == 'apktool'
+        run: |
+          set +e
+          LOG="$GITHUB_WORKSPACE/out/build.log"
+          built="$GITHUB_WORKSPACE/built"
+          mkdir -p "$built" out
+          echo "=== сборка распакованного приложения ===" >> "$LOG"
+          url=""
+          for i in 1 2 3; do
+            url=$(curl -fsSL "https://api.github.com/repos/iBotPeaches/Apktool/releases/latest" \
+              | grep -o '"browser_download_url": *"[^"]*apktool_[0-9.]*\.jar"' | head -n 1 | cut -d'"' -f4)
+            [ -n "$url" ] && break
+            sleep 3
+          done
+          if [ -z "$url" ]; then
+            url="https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar"
+          fi
+          echo "Сборщик: $url" >> "$LOG"
+          curl -fsSL "$url" -o /tmp/apktool.jar
+          if [ ! -s /tmp/apktool.jar ]; then
+            echo "Не смог скачать сборщик apktool" >> "$LOG"
+            tail -n 20 "$LOG"
+            exit 1
+          fi
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-34" "build-tools;34.0.0" >/dev/null 2>&1 || true
+          cd "$APKDIR"
+          java -jar /tmp/apktool.jar b -f --use-aapt2 . -o "$built/app.apktool.apk" >> "$LOG" 2>&1
+          code=$?
+          if [ $code -ne 0 ]; then
+            echo "=== пробую без aapt2 ===" >> "$LOG"
+            java -jar /tmp/apktool.jar b -f . -o "$built/app.apktool.apk" >> "$LOG" 2>&1
+            code=$?
+          fi
+          tail -n 40 "$LOG"
+          exit $code
+
+      - name: Make project
+        if: env.KIND == 'sources'
+        run: |
+          set -e
+          LOG="$GITHUB_WORKSPACE/out/build.log"
+          echo "=== готовлю проект сборки вокруг исходников ===" >> "$LOG"
+          if [ ! -x /opt/gradle-8.9/bin/gradle ]; then
+            curl -fsSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.9-bin.zip
+            unzip -q -o /tmp/gradle.zip -d /opt
+          fi
+          echo "/opt/gradle-8.9/bin" >> "$GITHUB_PATH"
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-34" "build-tools;34.0.0" >/dev/null 2>&1 || true
+          python3 - "$MANIFEST" "$GITHUB_WORKSPACE" <<'PYEOF' >> "$LOG" 2>&1
+          import os
+          import re
+          import sys
+
+          man = os.path.abspath(sys.argv[1])
+          ws = os.path.abspath(sys.argv[2])
+          sdir = os.path.dirname(man)
+          root = os.path.join(ws, "auto")
+          app = os.path.join(root, "app")
+          os.makedirs(app, exist_ok=True)
+
+          txt = ""
+          try:
+              txt = open(man, encoding="utf-8", errors="replace").read()
+          except Exception as exc:
+              print("манифест не прочитался: %s" % exc)
+
+
+          def attr(name, default=""):
+              for q in ('"', "'"):
+                  m = re.search(re.escape(name) + r"\s*=\s*" + q + r"([^" + q + r"]*)" + q, txt)
+                  if m:
+                      return m.group(1).strip()
+              return default
+
+
+          def digits(value, default):
+              m = re.search(r"\d+", value or "")
+              return m.group(0) if m else default
+
+
+          pkg = attr("package")
+          if not re.match(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$", pkg or ""):
+              pkg = "com.autoforge.app"
+          minv = digits(attr("android:minSdkVersion"), "21")
+          tgt = digits(attr("android:targetSdkVersion"), "34")
+          vcode = digits(attr("android:versionCode"), "1")
+          vname = attr("android:versionName") or "1.0"
+
+          skip = {".git", ".gradle", "build", "out", ".idea"}
+          java_dirs, kt_dirs, res_dirs, assets_dirs, jni_dirs = set(), set(), set(), set(), set()
+          marks = []
+
+          for base, dirs, files in os.walk(sdir):
+              rel = os.path.relpath(base, sdir)
+              depth = 0 if rel == "." else rel.count(os.sep) + 1
+              if depth > 5:
+                  dirs[:] = []
+                  continue
+              dirs[:] = [d for d in dirs if d not in skip]
+              name = os.path.basename(base)
+              if name == "res" and os.path.isfile(os.path.join(base, "values", "strings.xml")):
+                  res_dirs.add(base)
+              if name == "assets":
+                  assets_dirs.add(base)
+              if name in ("jniLibs", "lib"):
+                  jni_dirs.add(base)
+              for f in files:
+                  if f.endswith(".java"):
+                      java_dirs.add(base)
+                  elif f.endswith(".kt"):
+                      kt_dirs.add(base)
+                  if f.endswith((".java", ".kt")) and len(marks) < 400:
+                      try:
+                          marks.append(open(os.path.join(base, f), encoding="utf-8",
+                                            errors="replace").read())
+                      except Exception:
+                          pass
+
+          def near_root(d):
+              cur = d
+              while True:
+                  if os.path.basename(cur) in ("java", "kotlin", "src"):
+                      return cur
+                  parent = os.path.dirname(cur)
+                  if parent == cur or not parent.startswith(sdir) or parent == sdir:
+                      return d
+                  cur = parent
+
+
+          java_dirs = set(near_root(d) for d in java_dirs)
+          kt_dirs = set(near_root(d) for d in kt_dirs)
+
+          blob = "\n".join(marks)
+          use_androidx = "androidx." in blob
+          use_support = "android.support." in blob
+          use_kotlin = bool(kt_dirs)
+          jars = os.path.join(sdir, "libs")
+
+          clean_man = os.path.join(root, "AndroidManifest.xml")
+          with open(clean_man, "w", encoding="utf-8") as fh:
+              fh.write(re.sub(r'\s+package\s*=\s*"[^"]*"', "", txt, count=1))
+          print("манифест подготовлен без старого имени пакета: %s" % clean_man)
+
+
+          def quoted(paths):
+              return ", ".join("'" + p.replace("'", "") + "'" for p in sorted(paths))
+
+
+          settings = (
+              "pluginManagement {\n"
+              "    repositories { google(); mavenCentral(); gradlePluginPortal() }\n"
+              "}\n"
+              "dependencyResolutionManagement {\n"
+              "    repositories { google(); mavenCentral() }\n"
+              "}\n"
+              "rootProject.name = 'AutoForge'\n"
+              "include ':app'\n"
+          )
+          root_gradle = "plugins {\n    id 'com.android.application' version '8.5.2' apply false\n"
+          if use_kotlin:
+              root_gradle += "    id 'org.jetbrains.kotlin.android' version '1.9.24' apply false\n"
+          root_gradle += "}\n"
+
+          props = (
+              "android.useAndroidX=true\n"
+              "android.enableJetifier=true\n"
+              "org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8\n"
+              "android.suppressUnsupportedCompileSdk=34\n"
+          )
+
+          app_gradle = "plugins {\n    id 'com.android.application'\n"
+          if use_kotlin:
+              app_gradle += "    id 'org.jetbrains.kotlin.android'\n"
+          app_gradle += "}\n\nandroid {\n"
+          app_gradle += "    namespace '%s'\n" % pkg
+          app_gradle += "    compileSdk 34\n"
+          app_gradle += "    defaultConfig {\n"
+          app_gradle += "        applicationId '%s'\n" % pkg
+          app_gradle += "        minSdk %s\n" % minv
+          app_gradle += "        targetSdk %s\n" % tgt
+          app_gradle += "        versionCode %s\n" % vcode
+          app_gradle += "        versionName '%s'\n" % vname.replace("'", "")
+          app_gradle += "    }\n"
+          app_gradle += "    compileOptions {\n"
+          app_gradle += "        sourceCompatibility JavaVersion.VERSION_17\n"
+          app_gradle += "        targetCompatibility JavaVersion.VERSION_17\n"
+          app_gradle += "    }\n"
+          if use_kotlin:
+              app_gradle += "    kotlinOptions { jvmTarget = '17' }\n"
+          app_gradle += "    sourceSets {\n        main {\n"
+          app_gradle += "            manifest.srcFile '%s'\n" % clean_man.replace("'", "")
+          if java_dirs:
+              app_gradle += "            java.srcDirs = [%s]\n" % quoted(java_dirs)
+          if kt_dirs:
+              app_gradle += "            kotlin.srcDirs = [%s]\n" % quoted(kt_dirs)
+          if res_dirs:
+              app_gradle += "            res.srcDirs = [%s]\n" % quoted(res_dirs)
+          if assets_dirs:
+              app_gradle += "            assets.srcDirs = [%s]\n" % quoted(assets_dirs)
+          if jni_dirs:
+              app_gradle += "            jniLibs.srcDirs = [%s]\n" % quoted(jni_dirs)
+          app_gradle += "        }\n    }\n"
+          app_gradle += "    lint { abortOnError false }\n"
+          app_gradle += "    buildTypes { debug { minifyEnabled false } }\n"
+          app_gradle += "}\n\ndependencies {\n"
+          if os.path.isdir(jars):
+              app_gradle += "    implementation fileTree(dir: '%s', include: ['*.jar'])\n" % jars.replace("'", "")
+          if use_androidx:
+              app_gradle += "    implementation 'androidx.appcompat:appcompat:1.6.1'\n"
+              app_gradle += "    implementation 'androidx.core:core:1.13.1'\n"
+              app_gradle += "    implementation 'com.google.android.material:material:1.11.0'\n"
+          app_gradle += "}\n"
+
+          for name, body in (("settings.gradle", settings), ("build.gradle", root_gradle),
+                             ("gradle.properties", props),
+                             (os.path.join("app", "build.gradle"), app_gradle)):
+              with open(os.path.join(root, name), "w", encoding="utf-8") as fh:
+                  fh.write(body)
+
+          print("пакет: %s" % pkg)
+          print("версии: minSdk %s, targetSdk %s, код %s, имя %s" % (minv, tgt, vcode, vname))
+          print("исходников: java в %d папках, kotlin в %d папках" % (len(java_dirs), len(kt_dirs)))
+          print("ресурсов: %d, assets: %d, нативных: %d" % (len(res_dirs), len(assets_dirs), len(jni_dirs)))
+          print("androidx в коде: %s" % ("да" if use_androidx else "нет"))
+          if use_support:
+              print("ВНИМАНИЕ: код использует старую библиотеку поддержки android.support")
+          print("проект готов: %s" % root)
+          PYEOF
+          echo "PROJECT=$GITHUB_WORKSPACE/auto" >> "$GITHUB_ENV"
+          echo "Проект вокруг исходников готов, запускаю сборку" >> "$LOG"
+          tail -n 20 "$LOG"
+
+      - name: Collect and sign
+        if: always()
+        run: |
+          set +e
+          mkdir -p out
+          [ -s /tmp/forge.jks ] || echo "Ключ подписи недоступен: подпись пропущена" >> out/build.log
+          BT=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* 2>/dev/null | sort -V | tail -n 1)
+          sign_apk() {
+            target="$1"
+            for kt in auto PKCS12 JKS; do
+              for use_alias in yes no; do
+                args=""
+                [ "$kt" != "auto" ] && args="--ks-type $kt"
+                [ "$use_alias" = "yes" ] && args="$args --ks-key-alias $KS_ALIAS"
+                "$BT/apksigner" sign $args --ks /tmp/forge.jks \
+                  --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" "$target" >/dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                  return 0
+                fi
+              done
+            done
+            return 1
+          }
+          found=0
+          for apk in $(find . -name "*.apk" -not -path "./out/*" -not -path "./key/*" | sort); do
+            base=$(basename "$apk")
+            cp -f "$apk" "out/$base"
+            found=1
+            [ -n "$BT" ] || continue
+            [ -s /tmp/forge.jks ] || continue
+            zip -qd "out/$base" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/*.SF" >/dev/null 2>&1
+            "$BT/zipalign" -f -p 4 "out/$base" "out/_a_$base" >/dev/null 2>&1 && mv -f "out/_a_$base" "out/$base"
+            if sign_apk "out/$base"; then
+              echo "Подписан постоянным ключом: $base" >> out/build.log
+            else
+              echo "Подписать не удалось, проверь пароль и алиас ключа: $base" >> out/build.log
+            fi
+          done
+          rm -f out/*.idsig
+          if [ $found -eq 0 ]; then
+            echo "APK не найден: сборка не создала apk-файл" >> out/build.log
+          else
+            first=$(ls out/*.apk 2>/dev/null | head -n 1)
+            if [ -n "$first" ] && [ -n "$BT" ]; then
+              "$BT/apksigner" verify --print-certs "$first" 2>/dev/null \
+                | grep -i "SHA-256 digest" | head -n 1 > out/key.txt
+            fi
+          fi
+          ls -la out
+          exit 0
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: out
+          path: out
+          if-no-files-found: warn
+          retention-days: 1
