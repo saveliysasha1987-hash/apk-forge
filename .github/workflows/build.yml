@@ -33,6 +33,7 @@ jobs:
     timeout-minutes: 60
     env:
       MODE: ${{ inputs.mode }}
+      JOB_ID: ${{ inputs.job_id }}
       SRC: ${{ inputs.source }}
       SRC_SECRET: ${{ secrets.FORGE_SRC_URL }}
       REF: ${{ inputs.ref }}
@@ -62,27 +63,57 @@ jobs:
         run: |
           set -e
           mkdir -p src out
+          secret_url=""
+          secret_token=""
+          if [ -n "$SRC_SECRET" ]; then
+            set -- $SRC_SECRET
+            if [ "$1" != "$JOB_ID" ]; then
+              echo "Ссылка исходников в секрете принадлежит другой сборке; подожди и повтори" | tee -a out/build.log
+              exit 1
+            fi
+            secret_url="$2"
+            secret_token="${3:-}"
+          fi
           if [ "$MODE" = "repo" ]; then
+            src="$SRC"
+            [ -n "$src" ] || src="$secret_url"
+            [ -n "$src" ] || { echo "Нет адреса репозитория" | tee -a out/build.log; exit 1; }
             if [ -n "$REF" ]; then
-              git clone --depth 1 --branch "$REF" "$SRC" src
+              git clone --depth 1 --branch "$REF" "$src" src
             else
-              git clone --depth 1 "$SRC" src
+              git clone --depth 1 "$src" src
             fi
           else
             src="$SRC"
-            [ -n "$src" ] || src="$SRC_SECRET"
+            [ -n "$src" ] || src="$secret_url"
+            [ -n "$src" ] || { echo "Нет ссылки на архив: нужен секрет FORGE_SRC_URL" | tee -a out/build.log; exit 1; }
             case "$src" in
               http*)
-                curl -fsSL "$src" -o src.zip
+                curl -fsSL "$src" -o src.dl
                 ;;
               *)
-                echo "Не понял источник: нужна ссылка на zip или секрет FORGE_SRC_URL"
+                echo "Не понял источник: нужна ссылка на архив" | tee -a out/build.log
                 exit 1
                 ;;
             esac
+            magic=$(od -An -tx1 -N2 src.dl | tr -d ' \n')
+            if [ "$magic" = "1f8b" ]; then
+              gunzip -c src.dl > src.zip
+            else
+              cp src.dl src.zip
+            fi
             unzip -q -o src.zip -d src
+            if [ -n "$secret_token" ]; then
+              curl -fsS -X DELETE -H "X-Token: $secret_token" "$secret_url" >/dev/null 2>&1 || true
+            fi
+            case "$secret_url" in
+              *uguu.se*)
+                curl -fsS -X POST -F "files[]=$secret_url" https://uguu.se/delete >/dev/null 2>&1 || true
+                ;;
+            esac
           fi
           find src -maxdepth 2 | head -n 40
+
       - name: Prepare project
         run: |
           set -e
