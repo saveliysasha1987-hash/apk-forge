@@ -107,6 +107,9 @@ jobs:
               curl -fsS -X DELETE -H "X-Token: $secret_token" "$secret_url" >/dev/null 2>&1 || true
             fi
             case "$secret_url" in
+              *filebin.net*)
+                curl -fsS -X DELETE "$secret_url" >/dev/null 2>&1 || true
+                ;;
               *uguu.se*)
                 curl -fsS -X POST -F "files[]=$secret_url" https://uguu.se/delete >/dev/null 2>&1 || true
                 ;;
